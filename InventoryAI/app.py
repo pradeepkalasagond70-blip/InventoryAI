@@ -1469,3 +1469,4 @@ st.caption(
     "InventoryAI | XGBoost-powered Retail Inventory "
     "Intelligence Platform"
 )
+
