@@ -287,7 +287,7 @@ st.markdown("""
 def load_data():
 
     return pd.read_csv(
-        "data/InventoryAI_Final_Dataset.csv"
+        "InventoryAI/data/InventoryAI_Final_Dataset.csv"
     )
 
 
@@ -301,7 +301,7 @@ def load_model():
     model = XGBRegressor()
 
     model.load_model(
-        "model/inventoryai_xgb_model.json"
+        "InventoryAI/model/inventoryai_xgb_model.json"
     )
 
     return model
