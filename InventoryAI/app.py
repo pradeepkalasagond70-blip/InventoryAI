@@ -1,4 +1,5 @@
 import streamlit as st
+from pathlib import Path
 import pandas as pd
 import numpy as np
 from xgboost import XGBRegressor
@@ -280,6 +281,13 @@ st.markdown("""
 
 
 # =========================================================
+# APPLICATION PATHS
+# =========================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+# =========================================================
 # LOAD DEMO DATA
 # =========================================================
 
@@ -287,7 +295,7 @@ st.markdown("""
 def load_data():
 
     return pd.read_csv(
-        "InventoryAI/data/InventoryAI_Final_Dataset.csv"
+        BASE_DIR / "data" / "InventoryAI_Final_Dataset.csv"
     )
 
 
@@ -301,7 +309,7 @@ def load_model():
     model = XGBRegressor()
 
     model.load_model(
-        "InventoryAI/model/inventoryai_xgb_model.json"
+        BASE_DIR / "model" / "inventoryai_xgb_demand_model.json"
     )
 
     return model
@@ -311,12 +319,14 @@ def load_model():
 # MODEL FEATURES
 # =========================================================
 
+# Demand-only forecasting features.
+# Current Inventory is deliberately excluded from the ML model because
+# inventory is used AFTER demand is forecast to make replenishment decisions.
 MODEL_FEATURES = [
     "Year",
     "Month",
     "Day",
     "Day_of_Week",
-    "Inventory Level",
     "Price",
     "Discount",
     "Lag_1",
@@ -463,160 +473,179 @@ def create_features(df):
 # INVENTORY DECISION ENGINE
 # =========================================================
 
-def create_inventory_intelligence(
-    df,
-    model
-):
+def create_inventory_intelligence(df, model):
+    """
+    Generate a true 7-day recursive demand forecast for each Store × Product.
+
+    Business logic:
+        Historical Units Sold
+            -> demand-only XGBoost
+            -> Day 1 forecast
+            -> append Day 1 to history
+            -> Day 2 forecast
+            -> ...
+            -> Day 7 forecast
+            -> compare 7-day demand with current inventory
+            -> replenishment recommendation
+
+    Inventory Level is NOT an ML feature.
+    """
 
     df = df.copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).copy()
 
-    # -----------------------------------------------------
-    # XGBOOST PREDICTION
-    # -----------------------------------------------------
+    if "Category" not in df.columns:
+        df["Category"] = "Unknown"
 
-    model_input = df[
-        MODEL_FEATURES
-    ]
+    if "Price" not in df.columns:
+        df["Price"] = 0.0
 
-    df["Predicted Units Sold"] = (
-        model.predict(model_input)
-    )
+    if "Discount" not in df.columns:
+        df["Discount"] = 0.0
 
-    # Prevent negative predictions
+    df["Price"] = pd.to_numeric(df["Price"], errors="coerce").fillna(0.0)
+    df["Discount"] = pd.to_numeric(df["Discount"], errors="coerce").fillna(0.0)
+    df["Units Sold"] = pd.to_numeric(df["Units Sold"], errors="coerce").fillna(0.0)
+    df["Inventory Level"] = pd.to_numeric(
+        df["Inventory Level"], errors="coerce"
+    ).fillna(0.0)
 
-    df["Predicted Units Sold"] = (
-        df["Predicted Units Sold"]
-        .clip(lower=0)
-    )
+    df = df.sort_values(
+        ["Store ID", "Product ID", "Date"]
+    ).copy()
 
-    # -----------------------------------------------------
-    # FORECAST WEEKLY DEMAND
-    # -----------------------------------------------------
+    # ---------------------------------------------------------
+    # Helper: build demand features from a sales history series.
+    # ---------------------------------------------------------
+    def build_forecast_features(history, forecast_date, price, discount):
+        sales = pd.Series(history, dtype=float)
 
-    df["Forecasted Weekly Demand"] = (
+        if len(sales) < 28:
+            raise ValueError(
+                "At least 28 historical sales observations are required "
+                "for recursive forecasting."
+            )
 
-        df["Predicted Units Sold"] * 7
+        return pd.DataFrame([{
+            "Year": forecast_date.year,
+            "Month": forecast_date.month,
+            "Day": forecast_date.day,
+            "Day_of_Week": forecast_date.dayofweek,
+            "Price": price,
+            "Discount": discount,
+            "Lag_1": sales.iloc[-1],
+            "Lag_7": sales.iloc[-7],
+            "Lag_14": sales.iloc[-14],
+            "Lag_28": sales.iloc[-28],
+            "Rolling_7": sales.iloc[-7:].mean(),
+            "Rolling_28": sales.iloc[-28:].mean(),
+        }])[MODEL_FEATURES]
 
-    )
+    # ---------------------------------------------------------
+    # Recursive 7-day forecasting.
+    # ---------------------------------------------------------
+    forecast_rows = []
 
-    # -----------------------------------------------------
-    # INVENTORY COVERAGE %
-    #
-    # Current Inventory
-    # ------------------------- × 100
-    # Forecasted Weekly Demand
-    # -----------------------------------------------------
+    for (store_id, product_id), group in df.groupby(
+        ["Store ID", "Product ID"],
+        sort=False
+    ):
+        group = group.sort_values("Date").copy()
 
-    df["Inventory_Coverage_Percent"] = (
+        if len(group) < 28:
+            continue
 
-        np.where(
+        history = group["Units Sold"].astype(float).tolist()
+        last_date = group["Date"].max()
 
-            df["Forecasted Weekly Demand"] > 0,
+        latest_price = float(group["Price"].iloc[-1])
+        latest_discount = float(group["Discount"].iloc[-1])
 
-            (
-                df["Inventory Level"]
-                /
-                df["Forecasted Weekly Demand"]
-            ) * 100,
-
-            100
-
+        # Current inventory is the latest available inventory position.
+        latest_inventory = float(group["Inventory Level"].iloc[-1])
+        latest_category = group["Category"].iloc[-1]
+        latest_region = (
+            group["Region"].iloc[-1]
+            if "Region" in group.columns
+            else "Unknown"
         )
 
-    )
+        daily_forecasts = []
 
-    # -----------------------------------------------------
-    # RISK CLASSIFICATION
-    #
-    # < 25%       → HIGH
-    # 25% - <75%  → MEDIUM
-    # >= 75%      → LOW
-    # -----------------------------------------------------
+        for horizon in range(1, 8):
+            forecast_date = last_date + pd.Timedelta(days=horizon)
 
-    def classify_risk(
-        coverage
-    ):
+            features = build_forecast_features(
+                history,
+                forecast_date,
+                latest_price,
+                latest_discount
+            )
+
+            prediction = float(model.predict(features)[0])
+            prediction = max(prediction, 0.0)
+
+            daily_forecasts.append(prediction)
+
+            # Feed the prediction into the next day's lag/rolling features.
+            history.append(prediction)
+
+        weekly_demand = float(sum(daily_forecasts))
+
+        coverage = (
+            (latest_inventory / weekly_demand) * 100
+            if weekly_demand > 0
+            else 100.0
+        )
 
         if coverage < 25:
-
-            return "High"
-
+            risk = "High"
+            recommendation = "Urgent Reorder"
         elif coverage < 75:
-
-            return "Medium"
-
+            risk = "Medium"
+            recommendation = "Plan Reorder"
         else:
+            risk = "Low"
+            recommendation = "Healthy Stock"
 
-            return "Low"
-
-    df["Risk_Level"] = (
-
-        df[
-            "Inventory_Coverage_Percent"
-        ]
-
-        .apply(
-            classify_risk
+        recommended_order = max(
+            weekly_demand - latest_inventory,
+            0.0
         )
 
-    )
+        forecast_rows.append({
+            "Date": last_date,
+            "Store ID": store_id,
+            "Product ID": product_id,
+            "Category": latest_category,
+            "Region": latest_region,
+            "Inventory Level": latest_inventory,
+            "Price": latest_price,
+            "Discount": latest_discount,
+            "Predicted Units Sold": daily_forecasts[-1],
+            "Forecasted Weekly Demand": weekly_demand,
+            "Inventory_Coverage_Percent": coverage,
+            "Risk_Level": risk,
+            "Recommended_Order_Qty": int(np.ceil(recommended_order)),
+            "Recommendation": recommendation,
 
-    # -----------------------------------------------------
-    # RECOMMENDED ORDER
-    #
-    # Weekly Forecast - Current Inventory
-    # -----------------------------------------------------
+            # Keep the seven individual forecasts for validation/auditability.
+            "Forecast_Day_1": daily_forecasts[0],
+            "Forecast_Day_2": daily_forecasts[1],
+            "Forecast_Day_3": daily_forecasts[2],
+            "Forecast_Day_4": daily_forecasts[3],
+            "Forecast_Day_5": daily_forecasts[4],
+            "Forecast_Day_6": daily_forecasts[5],
+            "Forecast_Day_7": daily_forecasts[6],
+        })
 
-    df["Recommended_Order_Qty"] = (
-
-        df["Forecasted Weekly Demand"]
-        -
-        df["Inventory Level"]
-
-    ).clip(
-        lower=0
-    )
-
-    df["Recommended_Order_Qty"] = (
-
-        np.ceil(
-            df["Recommended_Order_Qty"]
+    if not forecast_rows:
+        raise ValueError(
+            "No Store × Product group has enough history for a 7-day forecast."
         )
 
-        .astype(int)
-
-    )
-
-    # -----------------------------------------------------
-    # BUSINESS RECOMMENDATION
-    # -----------------------------------------------------
-
-    def recommendation(
-        row
-    ):
-
-        if row["Risk_Level"] == "High":
-
-            return "Urgent Reorder"
-
-        elif row["Risk_Level"] == "Medium":
-
-            return "Plan Reorder"
-
-        else:
-
-            return "Healthy Stock"
-
-    df["Recommendation"] = (
-
-        df.apply(
-            recommendation,
-            axis=1
-        )
-
-    )
-
-    return df
+    return pd.DataFrame(forecast_rows)
 
 
 # =========================================================
@@ -689,7 +718,7 @@ with param_left:
 with param_right:
     st.markdown("**Recommended Columns**")
     st.markdown("""
-    - Category
+    - Category (for category intelligence)
     - Region
     - Price
     - Discount
@@ -762,40 +791,24 @@ if is_uploaded_data:
         "⚙️ Preparing dataset and generating features..."
     ):
 
-        # Feature engineering
-
-        df = create_features(
-            df
-        )
-
-        # Remove rows without enough history
-
-        df = df.dropna(
-            subset=[
-                "Lag_1",
-                "Lag_7",
-                "Lag_14",
-                "Lag_28",
-                "Rolling_7",
-                "Rolling_28"
-            ]
-        ).copy()
+        # Validate/prepare the historical dataset.
+        # The recursive forecasting engine creates the actual forecast features.
+        df = create_features(df)
 
         if len(df) == 0:
-
             st.error(
-                "❌ Not enough historical data to "
-                "generate the required demand features."
+                "❌ No valid historical records were found."
             )
-
             st.stop()
 
-        # Generate predictions + decisions
-
-        df = create_inventory_intelligence(
-            df,
-            model
-        )
+        try:
+            df = create_inventory_intelligence(
+                df,
+                model
+            )
+        except ValueError as e:
+            st.error(f"❌ {e}")
+            st.stop()
 
 
 # =========================================================
@@ -805,134 +818,19 @@ if is_uploaded_data:
 else:
 
     # -----------------------------------------------------
-    # DEMO DATA ALREADY CONTAINS PREDICTIONS
+    # DEMO DATA
     # -----------------------------------------------------
-
-    if "Predicted Units Sold" not in df.columns:
-
-        st.error(
-            "❌ Demo dataset does not contain "
-            "Predicted Units Sold."
+    # The bundled demo is treated as raw historical data.
+    # Any stale prediction columns in the CSV are ignored.
+    try:
+        df = create_inventory_intelligence(
+            create_features(df),
+            model
         )
-
+    except ValueError as e:
+        st.error(f"❌ {e}")
         st.stop()
 
-    # -----------------------------------------------------
-    # WEEKLY FORECAST
-    # -----------------------------------------------------
-
-    df["Forecasted Weekly Demand"] = (
-
-        df["Predicted Units Sold"] * 7
-
-    )
-
-    # -----------------------------------------------------
-    # INVENTORY COVERAGE %
-    # -----------------------------------------------------
-
-    df["Inventory_Coverage_Percent"] = (
-
-        np.where(
-
-            df["Forecasted Weekly Demand"] > 0,
-
-            (
-                df["Inventory Level"]
-                /
-                df["Forecasted Weekly Demand"]
-            ) * 100,
-
-            100
-
-        )
-
-    )
-
-    # -----------------------------------------------------
-    # RECALCULATE RISK
-    # -----------------------------------------------------
-
-    def classify_demo_risk(
-        coverage
-    ):
-
-        if coverage < 25:
-
-            return "High"
-
-        elif coverage < 75:
-
-            return "Medium"
-
-        else:
-
-            return "Low"
-
-    df["Risk_Level"] = (
-
-        df[
-            "Inventory_Coverage_Percent"
-        ]
-
-        .apply(
-            classify_demo_risk
-        )
-
-    )
-
-    # -----------------------------------------------------
-    # RECALCULATE ORDER QUANTITY
-    # -----------------------------------------------------
-
-    df["Recommended_Order_Qty"] = (
-
-        df["Forecasted Weekly Demand"]
-        -
-        df["Inventory Level"]
-
-    ).clip(
-        lower=0
-    )
-
-    df["Recommended_Order_Qty"] = (
-
-        np.ceil(
-            df["Recommended_Order_Qty"]
-        )
-
-        .astype(int)
-
-    )
-
-    # -----------------------------------------------------
-    # RECALCULATE RECOMMENDATION
-    # -----------------------------------------------------
-
-    def demo_recommendation(
-        row
-    ):
-
-        if row["Risk_Level"] == "High":
-
-            return "Urgent Reorder"
-
-        elif row["Risk_Level"] == "Medium":
-
-            return "Plan Reorder"
-
-        else:
-
-            return "Healthy Stock"
-
-    df["Recommendation"] = (
-
-        df.apply(
-            demo_recommendation,
-            axis=1
-        )
-
-    )
 
 
 # =========================================================
@@ -956,33 +854,11 @@ df["Date"] = pd.to_datetime(
     errors="coerce"
 )
 
-df = (
-
-    df
-
-    .sort_values(
-        [
-            "Store ID",
-            "Product ID",
-            "Date"
-        ]
-    )
-
-    .groupby(
-        [
-            "Store ID",
-            "Product ID"
-        ],
-        as_index=False
-    )
-
-    .tail(1)
-
-    .reset_index(
-        drop=True
-    )
-
-)
+# The forecasting engine already returns one current Store × Product
+# decision row, so no additional historical-row collapse is required.
+df = df.sort_values(
+    ["Store ID", "Product ID"]
+).reset_index(drop=True)
 
 
 # =========================================================
@@ -1131,14 +1007,13 @@ recommended_order = (
 )
 
 
-avg_coverage = (
-
-    filtered_df[
-        "Inventory_Coverage_Percent"
-    ]
-
-    .mean()
-
+overall_coverage = (
+    (
+        filtered_df["Inventory Level"].sum()
+        / filtered_df["Forecasted Weekly Demand"].sum()
+    ) * 100
+    if filtered_df["Forecasted Weekly Demand"].sum() > 0
+    else 100.0
 )
 
 
@@ -1191,8 +1066,8 @@ st.markdown(f"""
     </div>
     <div class="kpi-card">
         <div class="kpi-icon">◒</div>
-        <div class="kpi-label">AVG. INVENTORY COVERAGE</div>
-        <div class="kpi-value">{avg_coverage:.1f}%</div>
+        <div class="kpi-label">OVERALL INVENTORY COVERAGE</div>
+        <div class="kpi-value">{overall_coverage:.1f}%</div>
     </div>
     <div class="kpi-card">
         <div class="kpi-icon">🏪</div>
@@ -1531,39 +1406,43 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 category_summary = (
-
     filtered_df
-
-    .groupby(
-        "Category"
-    )
-
+    .groupby("Category", as_index=False)
     .agg(
-
-        Total_Inventory=(
-            "Inventory Level",
-            "sum"
-        ),
-
-        Avg_Weekly_Forecast=(
-            "Forecasted Weekly Demand",
-            "mean"
-        ),
-
-        Avg_Inventory_Coverage=(
-            "Inventory_Coverage_Percent",
-            "mean"
-        ),
-
-        Recommended_Order_Qty=(
-            "Recommended_Order_Qty",
-            "sum"
-        )
-
+        Current_Inventory=("Inventory Level", "sum"),
+        Weekly_Demand=("Forecasted Weekly Demand", "sum"),
     )
+)
 
-    .reset_index()
+category_summary["Recommended_Order"] = (
+    category_summary["Weekly_Demand"]
+    - category_summary["Current_Inventory"]
+).clip(lower=0)
 
+category_summary["Recommended_Order"] = (
+    np.ceil(category_summary["Recommended_Order"])
+    .astype(int)
+)
+
+category_summary["Inventory_Coverage_Percent"] = np.where(
+    category_summary["Weekly_Demand"] > 0,
+    (
+        category_summary["Current_Inventory"]
+        / category_summary["Weekly_Demand"]
+    ) * 100,
+    100
+)
+
+def classify_category_status(coverage):
+    if coverage < 25:
+        return "High"
+    elif coverage < 75:
+        return "Medium"
+    return "Low"
+
+category_summary["Category_Status"] = (
+    category_summary["Inventory_Coverage_Percent"]
+    .apply(classify_category_status)
 )
 
 
@@ -1572,10 +1451,10 @@ st.dataframe(
     use_container_width=True,
     hide_index=True,
     column_config={
-        "Total_Inventory": st.column_config.NumberColumn(format="%,.0f"),
-        "Avg_Weekly_Forecast": st.column_config.NumberColumn(format="%,.0f"),
-        "Avg_Inventory_Coverage": st.column_config.NumberColumn(format="%.1f%%"),
-        "Recommended_Order_Qty": st.column_config.NumberColumn(format="%,.0f"),
+        "Current_Inventory": st.column_config.NumberColumn(format="%,.0f"),
+        "Weekly_Demand": st.column_config.NumberColumn(format="%,.0f"),
+        "Recommended_Order": st.column_config.NumberColumn(format="%,.0f"),
+        "Inventory_Coverage_Percent": st.column_config.NumberColumn(format="%.1f%%"),
     }
 )
 
