@@ -342,147 +342,26 @@ MODEL_FEATURES = [
 # FEATURE ENGINEERING
 # =========================================================
 
-def create_features(df):
-
-    df = df.copy()
-
-    # -----------------------------------------------------
-    # DATE
-    # -----------------------------------------------------
-
-    df["Date"] = pd.to_datetime(
-        df["Date"],
-        errors="coerce"
-    )
-
-    df = df.dropna(
-        subset=["Date"]
-    )
-
-    # -----------------------------------------------------
-    # OPTIONAL COLUMNS
-    # -----------------------------------------------------
-
-    if "Category" not in df.columns:
-
-        df["Category"] = "Unknown"
-
-    if "Price" not in df.columns:
-
-        df["Price"] = 0
-
-    if "Discount" not in df.columns:
-
-        df["Discount"] = 0
-
-    # -----------------------------------------------------
-    # SORT DATA
-    # -----------------------------------------------------
-
-    df = df.sort_values(
-        [
-            "Store ID",
-            "Product ID",
-            "Date"
-        ]
-    ).copy()
-
-    # -----------------------------------------------------
-    # TIME FEATURES
-    # -----------------------------------------------------
-
-    df["Year"] = df["Date"].dt.year
-
-    df["Month"] = df["Date"].dt.month
-
-    df["Day"] = df["Date"].dt.day
-
-    df["Day_of_Week"] = (
-        df["Date"].dt.dayofweek
-    )
-
-    # -----------------------------------------------------
-    # LAG FEATURES
-    # -----------------------------------------------------
-
-    grouped_sales = df.groupby(
-        [
-            "Store ID",
-            "Product ID"
-        ]
-    )["Units Sold"]
-
-    df["Lag_1"] = (
-        grouped_sales.shift(1)
-    )
-
-    df["Lag_7"] = (
-        grouped_sales.shift(7)
-    )
-
-    df["Lag_14"] = (
-        grouped_sales.shift(14)
-    )
-
-    df["Lag_28"] = (
-        grouped_sales.shift(28)
-    )
-
-    # -----------------------------------------------------
-    # ROLLING FEATURES
-    # -----------------------------------------------------
-
-    df["Rolling_7"] = (
-
-        df.groupby(
-            [
-                "Store ID",
-                "Product ID"
-            ]
-        )["Units Sold"]
-
-        .transform(
-            lambda x:
-            x.shift(1)
-            .rolling(7)
-            .mean()
-        )
-    )
-
-    df["Rolling_28"] = (
-
-        df.groupby(
-            [
-                "Store ID",
-                "Product ID"
-            ]
-        )["Units Sold"]
-
-        .transform(
-            lambda x:
-            x.shift(1)
-            .rolling(28)
-            .mean()
-        )
-    )
-
-    return df
-
-
 # =========================================================
 # INVENTORY DECISION ENGINE
 # =========================================================
 
-def create_inventory_intelligence(df, model):
+@st.cache_data(show_spinner=False)
+def create_inventory_intelligence(df):
     """
     Generate a true 7-day recursive demand forecast for each Store × Product.
+
+    Performance design:
+        • XGBoost predictions are batched one horizon at a time.
+        • The model is called only 7 times (one batch per forecast day),
+          instead of once for every Store × Product × day.
+        • The completed decision dataframe is cached by Streamlit.
 
     Business logic:
         Historical Units Sold
             -> demand-only XGBoost
             -> Day 1 forecast
             -> append Day 1 to history
-            -> Day 2 forecast
             -> ...
             -> Day 7 forecast
             -> compare 7-day demand with current inventory
@@ -497,104 +376,103 @@ def create_inventory_intelligence(df, model):
 
     if "Category" not in df.columns:
         df["Category"] = "Unknown"
-
+    if "Region" not in df.columns:
+        df["Region"] = "Unknown"
     if "Price" not in df.columns:
         df["Price"] = 0.0
-
     if "Discount" not in df.columns:
         df["Discount"] = 0.0
 
     df["Price"] = pd.to_numeric(df["Price"], errors="coerce").fillna(0.0)
     df["Discount"] = pd.to_numeric(df["Discount"], errors="coerce").fillna(0.0)
     df["Units Sold"] = pd.to_numeric(df["Units Sold"], errors="coerce").fillna(0.0)
-    df["Inventory Level"] = pd.to_numeric(
-        df["Inventory Level"], errors="coerce"
-    ).fillna(0.0)
+    df["Inventory Level"] = pd.to_numeric(df["Inventory Level"], errors="coerce").fillna(0.0)
 
-    df = df.sort_values(
-        ["Store ID", "Product ID", "Date"]
-    ).copy()
+    df = df.sort_values(["Store ID", "Product ID", "Date"]).copy()
 
-    # ---------------------------------------------------------
-    # Helper: build demand features from a sales history series.
-    # ---------------------------------------------------------
-    def build_forecast_features(history, forecast_date, price, discount):
-        sales = pd.Series(history, dtype=float)
-
-        if len(sales) < 28:
-            raise ValueError(
-                "At least 28 historical sales observations are required "
-                "for recursive forecasting."
-            )
-
-        return pd.DataFrame([{
-            "Year": forecast_date.year,
-            "Month": forecast_date.month,
-            "Day": forecast_date.day,
-            "Day_of_Week": forecast_date.dayofweek,
-            "Price": price,
-            "Discount": discount,
-            "Lag_1": sales.iloc[-1],
-            "Lag_7": sales.iloc[-7],
-            "Lag_14": sales.iloc[-14],
-            "Lag_28": sales.iloc[-28],
-            "Rolling_7": sales.iloc[-7:].mean(),
-            "Rolling_28": sales.iloc[-28:].mean(),
-        }])[MODEL_FEATURES]
+    # Cached model is loaded once per Streamlit process.
+    model = load_model()
 
     # ---------------------------------------------------------
-    # Recursive 7-day forecasting.
+    # Prepare one history state per Store × Product.
     # ---------------------------------------------------------
-    forecast_rows = []
+    states = []
 
     for (store_id, product_id), group in df.groupby(
-        ["Store ID", "Product ID"],
-        sort=False
+        ["Store ID", "Product ID"], sort=False
     ):
-        group = group.sort_values("Date").copy()
+        group = group.sort_values("Date")
 
         if len(group) < 28:
             continue
 
-        history = group["Units Sold"].astype(float).tolist()
-        last_date = group["Date"].max()
+        states.append({
+            "Store ID": store_id,
+            "Product ID": product_id,
+            "history": group["Units Sold"].astype(float).tolist(),
+            "last_date": group["Date"].iloc[-1],
+            "price": float(group["Price"].iloc[-1]),
+            "discount": float(group["Discount"].iloc[-1]),
+            "inventory": float(group["Inventory Level"].iloc[-1]),
+            "category": group["Category"].iloc[-1],
+            "region": group["Region"].iloc[-1],
+            "forecasts": [],
+        })
 
-        latest_price = float(group["Price"].iloc[-1])
-        latest_discount = float(group["Discount"].iloc[-1])
-
-        # Current inventory is the latest available inventory position.
-        latest_inventory = float(group["Inventory Level"].iloc[-1])
-        latest_category = group["Category"].iloc[-1]
-        latest_region = (
-            group["Region"].iloc[-1]
-            if "Region" in group.columns
-            else "Unknown"
+    if not states:
+        raise ValueError(
+            "No Store × Product group has enough history for a 7-day forecast."
         )
 
-        daily_forecasts = []
+    # ---------------------------------------------------------
+    # Recursive forecasting, batched by horizon.
+    # ---------------------------------------------------------
+    for horizon in range(1, 8):
+        feature_rows = []
 
-        for horizon in range(1, 8):
-            forecast_date = last_date + pd.Timedelta(days=horizon)
+        for state in states:
+            history = state["history"]
+            forecast_date = state["last_date"] + pd.Timedelta(days=horizon)
 
-            features = build_forecast_features(
-                history,
-                forecast_date,
-                latest_price,
-                latest_discount
-            )
+            feature_rows.append({
+                "Year": forecast_date.year,
+                "Month": forecast_date.month,
+                "Day": forecast_date.day,
+                "Day_of_Week": forecast_date.dayofweek,
+                "Price": state["price"],
+                "Discount": state["discount"],
+                "Lag_1": history[-1],
+                "Lag_7": history[-7],
+                "Lag_14": history[-14],
+                "Lag_28": history[-28],
+                "Rolling_7": float(np.mean(history[-7:])),
+                "Rolling_28": float(np.mean(history[-28:])),
+            })
 
-            prediction = float(model.predict(features)[0])
-            prediction = max(prediction, 0.0)
+        feature_batch = pd.DataFrame(feature_rows)[MODEL_FEATURES]
 
-            daily_forecasts.append(prediction)
+        # ONE XGBoost call for every forecast horizon.
+        predictions = model.predict(feature_batch)
+        predictions = np.maximum(np.asarray(predictions, dtype=float), 0.0)
 
-            # Feed the prediction into the next day's lag/rolling features.
-            history.append(prediction)
+        # Feed each prediction into its group's history for the next horizon.
+        for state, prediction in zip(states, predictions):
+            prediction = float(prediction)
+            state["forecasts"].append(prediction)
+            state["history"].append(prediction)
 
+    # ---------------------------------------------------------
+    # Inventory decision engine.
+    # ---------------------------------------------------------
+    forecast_rows = []
+
+    for state in states:
+        daily_forecasts = state["forecasts"]
         weekly_demand = float(sum(daily_forecasts))
+        inventory = state["inventory"]
 
         coverage = (
-            (latest_inventory / weekly_demand) * 100
+            (inventory / weekly_demand) * 100
             if weekly_demand > 0
             else 100.0
         )
@@ -609,28 +487,23 @@ def create_inventory_intelligence(df, model):
             risk = "Low"
             recommendation = "Healthy Stock"
 
-        recommended_order = max(
-            weekly_demand - latest_inventory,
-            0.0
-        )
+        recommended_order = max(weekly_demand - inventory, 0.0)
 
         forecast_rows.append({
-            "Date": last_date,
-            "Store ID": store_id,
-            "Product ID": product_id,
-            "Category": latest_category,
-            "Region": latest_region,
-            "Inventory Level": latest_inventory,
-            "Price": latest_price,
-            "Discount": latest_discount,
+            "Date": state["last_date"],
+            "Store ID": state["Store ID"],
+            "Product ID": state["Product ID"],
+            "Category": state["category"],
+            "Region": state["region"],
+            "Inventory Level": inventory,
+            "Price": state["price"],
+            "Discount": state["discount"],
             "Predicted Units Sold": daily_forecasts[-1],
             "Forecasted Weekly Demand": weekly_demand,
             "Inventory_Coverage_Percent": coverage,
             "Risk_Level": risk,
             "Recommended_Order_Qty": int(np.ceil(recommended_order)),
             "Recommendation": recommendation,
-
-            # Keep the seven individual forecasts for validation/auditability.
             "Forecast_Day_1": daily_forecasts[0],
             "Forecast_Day_2": daily_forecasts[1],
             "Forecast_Day_3": daily_forecasts[2],
@@ -639,11 +512,6 @@ def create_inventory_intelligence(df, model):
             "Forecast_Day_6": daily_forecasts[5],
             "Forecast_Day_7": daily_forecasts[6],
         })
-
-    if not forecast_rows:
-        raise ValueError(
-            "No Store × Product group has enough history for a 7-day forecast."
-        )
 
     return pd.DataFrame(forecast_rows)
 
@@ -791,10 +659,7 @@ if is_uploaded_data:
         "⚙️ Preparing dataset and generating features..."
     ):
 
-        # Validate/prepare the historical dataset.
-        # The recursive forecasting engine creates the actual forecast features.
-        df = create_features(df)
-
+        # The forecasting engine performs the required preparation internally.
         if len(df) == 0:
             st.error(
                 "❌ No valid historical records were found."
@@ -802,10 +667,7 @@ if is_uploaded_data:
             st.stop()
 
         try:
-            df = create_inventory_intelligence(
-                df,
-                model
-            )
+            df = create_inventory_intelligence(df)
         except ValueError as e:
             st.error(f"❌ {e}")
             st.stop()
@@ -823,10 +685,7 @@ else:
     # The bundled demo is treated as raw historical data.
     # Any stale prediction columns in the CSV are ignored.
     try:
-        df = create_inventory_intelligence(
-            create_features(df),
-            model
-        )
+        df = create_inventory_intelligence(df)
     except ValueError as e:
         st.error(f"❌ {e}")
         st.stop()
@@ -1103,6 +962,39 @@ risk_summary = (
     .rename_axis("Risk Level")
     .reset_index(name="Items")
 )
+
+# Coverage diagnostic: helps distinguish genuinely low inventory from
+# systematically high demand forecasts. It does not alter business logic.
+coverage_bins = [0, 25, 50, 75, 100, np.inf]
+coverage_labels = [
+    "<25%",
+    "25–<50%",
+    "50–<75%",
+    "75–100%",
+    ">100%"
+]
+coverage_distribution = pd.cut(
+    filtered_df["Inventory_Coverage_Percent"],
+    bins=coverage_bins,
+    labels=coverage_labels,
+    right=False,
+    include_lowest=True
+).value_counts().reindex(coverage_labels, fill_value=0)
+
+with st.expander("🔍 Coverage Diagnostic", expanded=False):
+    diagnostic_df = pd.DataFrame({
+        "Coverage Range": coverage_labels,
+        "Products": coverage_distribution.values
+    })
+    st.dataframe(
+        diagnostic_df,
+        use_container_width=True,
+        hide_index=True
+    )
+    st.caption(
+        "This diagnostic shows why products are classified High, Medium or Low. "
+        "The 25% / 75% risk thresholds are unchanged."
+    )
 
 c1, c2 = st.columns([1.25, 1], gap="large")
 
@@ -1469,4 +1361,3 @@ st.caption(
     "InventoryAI | XGBoost-powered Retail Inventory "
     "Intelligence Platform"
 )
-
