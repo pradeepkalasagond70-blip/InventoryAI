@@ -2,5 +2,6 @@ streamlit==1.63.0
 pandas
 numpy
 xgboost
+scikit-learn
 plotly
 openpyxl
