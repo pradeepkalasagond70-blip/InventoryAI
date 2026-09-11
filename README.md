@@ -1,8 +1,9 @@
 **Try InventoryAI live:**
-
-👉 https://pradeep-inventoryai.streamlit.app/
+ https://pradeep-inventoryai.streamlit.app/
 
 InventoryAI is publicly deployed using Streamlit Community Cloud.
+
+# InventoryAI 🛒
 
 ## AI-Powered Retail Inventory Intelligence Platform
 
